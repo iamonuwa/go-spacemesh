@@ -101,7 +101,7 @@ func (cp *ConnectionPool) handleDialResult(rPub crypto.PublicKey, result dialRes
 func (cp *ConnectionPool) handleNewConnection(rPub crypto.PublicKey, conn net.Connection, source net.ConnectionSource) {
 	cp.connMutex.Lock()
 	cp.net.Logger().Debug("new connection %v -> %v. id=%s", cp.localPub, rPub, conn.ID())
-	// check if there isn't already same connection (possible if the second connection is a Remote connection)
+	// check if there isn't already same connection (possible if the second connection is a Remote connection) todo: FIX bug
 	//_, ok := cp.connections[rPub.String()]
 	//if ok {
 	//	cp.connMutex.Unlock()

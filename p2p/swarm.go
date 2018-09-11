@@ -237,8 +237,7 @@ func (s *swarm) processMessage(ime net.IncomingMessageEvent) {
 		err := s.onRemoteClientMessage(ime)
 		if err != nil {
 			s.lNode.Errorf("Err reading message from %v, closing connection err=%v", ime.Conn.RemotePublicKey(), err)
-
-			//ime.Conn.Close()
+			ime.Conn.Close()
 			// TODO: differentiate action on errors
 		}
 	}
