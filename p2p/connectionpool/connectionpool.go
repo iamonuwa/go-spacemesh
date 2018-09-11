@@ -36,6 +36,8 @@ type ConnectionPool struct {
 	dialWait    sync.WaitGroup
 	shutdown    bool
 
+	OnClose func(connection net.Connection)
+
 	newRemoteConn chan net.Connection
 	teardown      chan struct{}
 }
@@ -98,19 +100,18 @@ func (cp *ConnectionPool) handleDialResult(rPub crypto.PublicKey, result dialRes
 
 func (cp *ConnectionPool) handleNewConnection(rPub crypto.PublicKey, conn net.Connection, source net.ConnectionSource) {
 	cp.connMutex.Lock()
-	cp.net.Logger().Info("new connection %v -> %v. id=%s", cp.localPub, rPub, conn.ID())
+	cp.net.Logger().Debug("new connection %v -> %v. id=%s", cp.localPub, rPub, conn.ID())
 	// check if there isn't already same connection (possible if the second connection is a Remote connection)
-	_, ok := cp.connections[rPub.String()]
-	if ok {
-		cp.connMutex.Unlock()
-		if source == net.Remote {
-			cp.net.Logger().Info("connection created by remote node while connection already exists between peers, closing new connection. remote=%s", rPub)
-		} else {
-			cp.net.Logger().Warning("connection created by local node while connection already exists between peers, closing new connection. remote=%s", rPub)
-		}
-		conn.Close()
-		return
-	}
+	//_, ok := cp.connections[rPub.String()]
+	//if ok {
+	//	cp.connMutex.Unlock()
+	//	if source == net.Remote {
+	//		cp.net.Logger().Info("connection created by remote node while connection already exists between peers, closing new connection. remote=%s", rPub)
+	//	} else {
+	//		cp.net.Logger().Warning("connection created by local node while connection already exists between peers, closing new connection. remote=%s", rPub)
+	//	}
+	//	return
+	//} allways take new conntions
 	cp.connections[rPub.String()] = conn
 	cp.connMutex.Unlock()
 
@@ -120,7 +121,7 @@ func (cp *ConnectionPool) handleNewConnection(rPub crypto.PublicKey, conn net.Co
 }
 
 func (cp *ConnectionPool) handleClosedConnection(conn net.Connection) {
-	cp.net.Logger().Info("connection %s was closed", conn.String())
+	cp.net.Logger().Debug("connection %v with %v was closed", conn.String())
 	cp.connMutex.Lock()
 	rPub := conn.RemotePublicKey().String()
 	cur, ok := cp.connections[rPub]
@@ -129,6 +130,25 @@ func (cp *ConnectionPool) handleClosedConnection(conn net.Connection) {
 		delete(cp.connections, rPub)
 	}
 	cp.connMutex.Unlock()
+	if cp.OnClose != nil {
+		cp.OnClose(conn)
+	}
+}
+
+// GetConnectionIfExists returns the connection if it exists, it will return nil and an err if not.
+func (cp *ConnectionPool) GetConnectionIfExist(remotePub string) (net.Connection, error) {
+	cp.connMutex.RLock()
+	if cp.shutdown {
+		cp.connMutex.RUnlock()
+		return nil, errors.New("ConnectionPool was shut down")
+	}
+	// look for the connection in the pool
+	conn, found := cp.connections[remotePub]
+	if found {
+		cp.connMutex.RUnlock()
+		return conn, nil
+	}
+	return nil, errors.New("there is no connection with this key")
 }
 
 // GetConnection fetchs or creates if don't exist a connection to the address which is associated with the remote public key
@@ -152,6 +172,13 @@ func (cp *ConnectionPool) GetConnection(address string, remotePub crypto.PublicK
 	if !found {
 		// No one is waiting for a connection with the remote peer, need to call Dial
 		go func() {
+			// its annoying to check twice but we must to save some dials
+			//cp.connMutex.RLock() TODO: Check why this doesn't work
+			//if conn2, ok := cp.connections[remotePub.String()]; ok {
+			//	cp.handleDialResult(remotePub, dialResult{conn2, nil})
+			//}
+			//cp.connMutex.RUnlock()
+			//return
 			cp.dialWait.Add(1)
 			conn, err := cp.net.Dial(address, remotePub)
 			if err != nil {

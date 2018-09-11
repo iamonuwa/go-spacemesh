@@ -3,23 +3,25 @@ package p2p
 import (
 	"time"
 
-	"github.com/spacemeshos/go-spacemesh/log"
 	"github.com/spacemeshos/go-spacemesh/p2p/config"
 	"github.com/spacemeshos/go-spacemesh/p2p/dht"
 	"github.com/spacemeshos/go-spacemesh/p2p/net"
 	"github.com/spacemeshos/go-spacemesh/timesync"
 
-	"encoding/hex"
+	"bytes"
 	"errors"
 	"fmt"
+	"github.com/davecgh/go-spew/spew"
 	"github.com/gogo/protobuf/proto"
-	"github.com/spacemeshos/go-spacemesh/crypto"
 	"github.com/spacemeshos/go-spacemesh/p2p/connectionpool"
+	"github.com/spacemeshos/go-spacemesh/p2p/gossip"
+	"github.com/spacemeshos/go-spacemesh/p2p/message"
 	"github.com/spacemeshos/go-spacemesh/p2p/node"
 	"github.com/spacemeshos/go-spacemesh/p2p/pb"
 	"github.com/spacemeshos/go-spacemesh/p2p/service"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 type protocolMessage struct {
@@ -36,6 +38,8 @@ func (pm protocolMessage) Data() []byte {
 }
 
 type swarm struct {
+	started uint32
+
 	config config.Config
 
 	// set in construction and immutable state
@@ -45,6 +49,8 @@ type swarm struct {
 	// NOTE: maybe let more than one handler register on a protocol ?
 	protocolHandlers     map[string]chan service.Message
 	protocolHandlerMutex sync.RWMutex
+
+	gossip gossip.Protocol
 
 	network *net.Net
 
@@ -57,7 +63,7 @@ type swarm struct {
 }
 
 // newSwarm creates a new P2P instance
-func newSwarm(config config.Config, newNode bool) (*swarm, error) {
+func newSwarm(config config.Config, newNode bool, persist bool) (*swarm, error) {
 
 	port := config.TCPPort
 	address := fmt.Sprintf("127.0.0.1:%d", port)
@@ -67,9 +73,9 @@ func newSwarm(config config.Config, newNode bool) (*swarm, error) {
 	// Load an existing identity from file if exists.
 
 	if newNode {
-		l, err = node.NewNodeIdentity(config, address, true)
+		l, err = node.NewNodeIdentity(config, address, persist)
 	} else {
-		l, err = node.NewLocalNode(config, address, true)
+		l, err = node.NewLocalNode(config, address, persist)
 	}
 
 	if err != nil {
@@ -93,102 +99,50 @@ func newSwarm(config config.Config, newNode bool) (*swarm, error) {
 
 	s.dht = dht.New(l, config.SwarmConfig, s)
 
+	s.gossip = gossip.NewNeighborhood(config.SwarmConfig, s.dht, s.cPool, s.lNode.Log)
+
 	s.lNode.Debug("Created swarm for local node %s, %s", l.Address(), l.Pretty())
-
-
 
 	return s, nil
 }
 
-func (s *swarm) Start() error{
+func (s *swarm) Start() error {
+	if atomic.LoadUint32(&s.started) == 1 {
+		return errors.New("swarm already running")
+	}
+	atomic.StoreUint32(&s.started, 1)
+	s.lNode.Debug("Starting the p2p layer")
+
 	go s.listenToNetworkMessages()
 
+	go s.checkTimeDrifts()
+
 	if s.config.SwarmConfig.Bootstrap {
+		b := time.Now()
 		err := s.dht.Bootstrap()
 		if err != nil {
 			s.Shutdown()
 			return err
 		}
+
+		s.lNode.Info("DHT Bootstrapped with %d peers in %v", s.dht.Size(), time.Since(b))
 	}
 
-	go s.checkTimeDrifts()
+	if s.config.SwarmConfig.Bootstrap {
+		s.gossip.Start()
+	} else {
+		go s.gossip.Start() // todo handle error async
+	} // gossip flag
+
 	return nil
 }
 
-// newProtocolMessageMetadata creates meta-data for an outgoing protocol message authored by this node.
-func newProtocolMessageMetadata(author crypto.PublicKey, protocol string, gossip bool) *pb.Metadata {
-	return &pb.Metadata{
-		Protocol:      protocol,
-		ClientVersion: config.ClientVersion,
-		Timestamp:     time.Now().Unix(),
-		Gossip:        gossip,
-		AuthPubKey:    author.Bytes(),
-	}
-}
-
-func (s *swarm) localNode() *node.LocalNode {
+func (s *swarm) LocalNode() *node.LocalNode {
 	return s.lNode
 }
 
 func (s *swarm) connectionPool() *connectionpool.ConnectionPool {
 	return s.cPool
-}
-
-func signMessage(pv crypto.PrivateKey, pm *pb.ProtocolMessage) error {
-	data, err := proto.Marshal(pm)
-	if err != nil {
-		e := fmt.Errorf("invalid msg format %v", err)
-		return e
-	}
-
-	sign, err := pv.Sign(data)
-	if err != nil {
-		return fmt.Errorf("failed to sign message err:%v", err)
-	}
-
-	// TODO : AuthorSign: string => bytes
-	pm.Metadata.AuthorSign = hex.EncodeToString(sign)
-
-	return nil
-}
-
-// authAuthor authorizes that a message is signed by its claimed author
-func authAuthor(pm *pb.ProtocolMessage) error {
-	// TODO: consider getting pubkey from outside. attackar coul'd just manipulate the whole message pubkey and sign.
-	sign := pm.Metadata.AuthorSign
-	sPubkey := pm.Metadata.AuthPubKey
-
-	pubkey, err := crypto.NewPublicKey(sPubkey)
-	if err != nil {
-		return fmt.Errorf("could'nt create public key from %v, err: %v", hex.EncodeToString(sPubkey), err)
-	}
-
-	pm.Metadata.AuthorSign = "" // we have to verify the message without the sign
-
-	bin, err := proto.Marshal(pm)
-
-	if err != nil {
-		return err
-	}
-
-	binsig, err := hex.DecodeString(sign)
-	if err != nil {
-		return err
-	}
-
-	v, err := pubkey.Verify(bin, binsig)
-
-	if err != nil {
-		return err
-	}
-
-	if !v {
-		return fmt.Errorf("coudld'nt verify message")
-	}
-
-	pm.Metadata.AuthorSign = sign // restore sign because maybe we'll send it again ( gossip )
-
-	return nil
 }
 
 // SendMessage Sends a message to a remote node
@@ -199,17 +153,22 @@ func authAuthor(pm *pb.ProtocolMessage) error {
 // req.destId: receiver remote node public key/id
 // Local request to send a message to a remote node
 func (s *swarm) SendMessage(peerPubKey string, protocol string, payload []byte) error {
+	var err error
+	var peer node.Node
+	var conn net.Connection
 
-	peer, err := s.dht.Lookup(peerPubKey) // blocking, might issue a network lookup that'll take time.
+	peer, conn = s.gossip.Peer(peerPubKey) // check if he's a neighbor
+	if peer == node.EmptyNode {
+		peer, err = s.dht.Lookup(peerPubKey) // blocking, might issue a network lookup that'll take time.
 
-	if err != nil {
-		return err
-	}
-
-	conn, err := s.cPool.GetConnection(peer.Address(), peer.PublicKey()) // blocking, might take some time in case there is no connection
-	if err != nil {
-		s.lNode.Warning("failed to send message to %v, no valid connection. err: %v", peer.String(), err)
-		return err
+		if err != nil {
+			return err
+		}
+		conn, err = s.cPool.GetConnection(peer.Address(), peer.PublicKey()) // blocking, might take some time in case there is no connection
+		if err != nil {
+			s.lNode.Warning("failed to send message to %v, no valid connection. err: %v", peer.String(), err)
+			return err
+		}
 	}
 
 	session := conn.Session()
@@ -219,16 +178,16 @@ func (s *swarm) SendMessage(peerPubKey string, protocol string, payload []byte) 
 	}
 
 	protomessage := &pb.ProtocolMessage{
-		Metadata: newProtocolMessageMetadata(s.lNode.PublicKey(), protocol, false),
+		Metadata: message.NewProtocolMessageMetadata(s.lNode.PublicKey(), protocol, false),
 		Payload:  payload,
 	}
 
-	err = signMessage(s.lNode.PrivateKey(), protomessage)
+	err = message.SignMessage(s.lNode.PrivateKey(), protomessage)
 	if err != nil {
 		return err
 	}
 
-	err = authAuthor(protomessage)
+	err = message.AuthAuthor(protomessage)
 	if err != nil {
 		return err
 	}
@@ -238,33 +197,18 @@ func (s *swarm) SendMessage(peerPubKey string, protocol string, payload []byte) 
 		return fmt.Errorf("failed to encode signed message err: %v", err)
 	}
 
-	encPayload, err := session.Encrypt(data)
+	final, err := message.PrepareMessage(session, data)
+
 	if err != nil {
-		e := fmt.Errorf("aborting send - failed to encrypt payload: %v", err)
-		return e
+		return fmt.Errorf("failed to prepare message to send err=%v", err)
 	}
-
-	cmd := &pb.CommonMessageData{
-		SessionId: session.ID(),
-		Payload:   encPayload,
-		Timestamp: time.Now().Unix(),
-	}
-
-	final, err := proto.Marshal(cmd)
-	if err != nil {
-		e := fmt.Errorf("aborting send - invalid msg format %v", err)
-		return e
-	}
-
-	// finally - send it away!
-	s.lNode.Debug("Sending protocol message down the connection to %v", log.PrettyID(peerPubKey))
 
 	return conn.Send(final)
 }
 
 // RegisterProtocol registers an handler for `protocol`
 func (s *swarm) RegisterProtocol(protocol string) chan service.Message {
-	mchan := make(chan service.Message)
+	mchan := make(chan service.Message, 100)
 	s.protocolHandlerMutex.Lock()
 	s.protocolHandlers[protocol] = mchan
 	s.protocolHandlerMutex.Unlock()
@@ -286,17 +230,26 @@ func (s *swarm) shutdownInternal() {
 
 // process an incoming message
 func (s *swarm) processMessage(ime net.IncomingMessageEvent) {
-	err := s.onRemoteClientMessage(ime)
-	if err != nil {
-		ime.Conn.Close()
-		// TODO: differentiate action on errors
+	select {
+	case <-s.shutdown:
+		break
+	default:
+		err := s.onRemoteClientMessage(ime)
+		if err != nil {
+			s.lNode.Errorf("Err reading message from %v, closing connection err=%v", ime.Conn.RemotePublicKey(), err)
+
+			//ime.Conn.Close()
+			// TODO: differentiate action on errors
+		}
 	}
 }
 
 // update a full connection to the routing table.
 func (s *swarm) updateConnection(nc net.Connection) {
 	if nc.RemotePublicKey() != nil {
-		s.dht.Update(node.New(nc.RemotePublicKey(), fmt.Sprintf("%v:%v", strings.Split(nc.RemoteAddr().String(), ":")[0], s.config.TCPPort)))
+		//TODO: figure out; should we send listen port on handshake so we can
+		// save the right port from a remote connection. or just use a global listen port.
+		s.dht.Update(node.New(nc.RemotePublicKey(), fmt.Sprintf("%v:%v", strings.Split(nc.RemoteAddr().String(), ":")[0], nc.RemoteListenPort())))
 	}
 }
 
@@ -341,8 +294,10 @@ Loop:
 // onRemoteClientMessage possible errors
 
 var (
-	// ErrBadFormat could'nt deserialize
-	ErrBadFormat = errors.New("bad msg format, could'nt deserialize")
+	// ErrBadFormat1 could'nt deserialize the payload
+	ErrBadFormat1 = errors.New("bad msg format, could'nt deserialize 1")
+	// ErrBadFormat2 could'nt deserialize the protocol message payload
+	ErrBadFormat2 = errors.New("bad msg format, could'nt deserialize 2")
 	// ErrOutOfSync is returned when messsage timestamp was out of sync
 	ErrOutOfSync = errors.New("received out of sync msg")
 	// ErrNoPayload empty payload message
@@ -355,6 +310,8 @@ var (
 	ErrNoProtocol = errors.New("received msg to an unsupported protocol")
 	// ErrNoSession we don't have this session
 	ErrNoSession = errors.New("connection is missing a session")
+	// ErrNotFromPeer - we got message singed with a different publickkey and its not gossip
+	ErrNotFromPeer = errors.New("this message was signed with the wrong public key")
 )
 
 // onRemoteClientMessage pre-process a protocol message from a remote client handling decryption and authentication
@@ -367,7 +324,7 @@ func (s *swarm) onRemoteClientMessage(msg net.IncomingMessageEvent) error {
 	c := &pb.CommonMessageData{}
 	err := proto.Unmarshal(msg.Message, c)
 	if err != nil {
-		return ErrBadFormat
+		return ErrBadFormat1
 	}
 
 	// check that the message was send within a reasonable time
@@ -397,26 +354,47 @@ func (s *swarm) onRemoteClientMessage(msg net.IncomingMessageEvent) error {
 	pm := &pb.ProtocolMessage{}
 	err = proto.Unmarshal(decPayload, pm)
 	if err != nil {
-		return ErrBadFormat
+		s.lNode.Errorf("proto marshinling err=", err)
+		return ErrBadFormat2
 	}
-
+	if pm.Metadata == nil {
+		spew.Dump(pm)
+		panic("this is a defected message") // todo: Session bug, session scrambles messages and remove metadata
+	}
 	// authenticate message author - we already authenticated the sender via the shared session key secret
-	err = authAuthor(pm)
+	err = message.AuthAuthor(pm)
 	if err != nil {
 		return ErrAuthAuthor
 	}
 
+	if !pm.Metadata.Gossip && !bytes.Equal(pm.Metadata.AuthPubKey, msg.Conn.RemotePublicKey().Bytes()) {
+		//wtf ?
+		return ErrNotFromPeer
+	}
+
 	s.lNode.Debug("Authorized %v protocol message ", pm.Metadata.Protocol)
 
-	remoteNode := node.New(msg.Conn.RemotePublicKey(), fmt.Sprintf("%v:%v", strings.Split(msg.Conn.RemoteAddr().String(), ":")[0], s.config.TCPPort))
+	remoteNode := node.New(msg.Conn.RemotePublicKey(), fmt.Sprintf("%v:%v", strings.Split(msg.Conn.RemoteAddr().String(), ":")[0], msg.Conn.RemoteListenPort()))
 	// update the routing table - we just heard from this authenticated node
 	s.dht.Update(remoteNode)
+
+	// participate in gossip even if we don't know this protocol
+	if pm.Metadata.Gossip { // todo : use gossip uid
+		s.LocalNode().Debug("Got gossip message! relaying it")
+		// don't block anyway
+		err = s.gossip.Broadcast(decPayload) // err only if this is an old message
+	}
+
+	if err != nil {
+		return nil
+	}
 	// route authenticated message to the reigstered protocol
 	s.protocolHandlerMutex.RLock()
 	msgchan := s.protocolHandlers[pm.Metadata.Protocol]
 	s.protocolHandlerMutex.RUnlock()
 
 	if msgchan == nil {
+		s.LocalNode().Errorf("there was a bad protocol ", pm.Metadata.Protocol)
 		return ErrNoProtocol
 	}
 
@@ -424,4 +402,26 @@ func (s *swarm) onRemoteClientMessage(msg net.IncomingMessageEvent) error {
 	msgchan <- protocolMessage{remoteNode, pm.Payload}
 
 	return nil
+}
+
+// Broadcast creates a gossip message signs it and disseminate it to neighbors
+func (s *swarm) Broadcast(protocol string, payload []byte) error {
+	// start by making the message
+	pm := &pb.ProtocolMessage{
+		Metadata: message.NewProtocolMessageMetadata(s.LocalNode().PublicKey(), protocol, true),
+		Payload:  payload,
+	}
+
+	err := message.SignMessage(s.lNode.PrivateKey(), pm)
+	if err != nil {
+		return err
+	}
+
+	msg, err := proto.Marshal(pm)
+
+	if err != nil {
+		return err
+	}
+
+	return s.gossip.Broadcast(msg)
 }

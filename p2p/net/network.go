@@ -11,6 +11,8 @@ import (
 	"github.com/spacemeshos/go-spacemesh/p2p/pb"
 	"gopkg.in/op/go-logging.v1"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -43,6 +45,7 @@ type Net struct {
 
 	tcpListener      net.Listener
 	tcpListenAddress string // Address to open connection: localhost:9999\
+	port             int32
 
 	isShuttingDown bool
 
@@ -70,7 +73,13 @@ func NewNet(conf config.Config, localEntity *node.LocalNode) (*Net, error) {
 		config:             conf,
 	}
 
-	err := n.listen()
+	port, err := strconv.ParseInt(strings.Split(localEntity.Address(), ":")[1], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("bad address %v", err)
+	}
+	n.port = int32(port)
+
+	err = n.listen()
 
 	if err != nil {
 		return nil, err
@@ -135,7 +144,7 @@ func (n *Net) createSecuredConnection(address string, remotePublicKey crypto.Pub
 	if err != nil {
 		return nil, err
 	}
-	data, session, err := GenerateHandshakeRequestData(n.localNode.PublicKey(), n.localNode.PrivateKey(), remotePublicKey, n.networkID)
+	data, session, err := GenerateHandshakeRequestData(n.localNode.PublicKey(), n.localNode.PrivateKey(), remotePublicKey, n.networkID, n.port)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("%s err: %v", errMsg, err)
@@ -160,7 +169,7 @@ func (n *Net) createSecuredConnection(address string, remotePublicKey crypto.Pub
 	case msg, ok = <-conn.incomingChannel():
 		if !ok {
 			conn.Close()
-			return nil, fmt.Errorf("%s err: incoming channel got closed", errMsg)
+			return nil, fmt.Errorf("%s err: incoming channel got closed with %v", errMsg, conn.RemotePublicKey())
 		}
 	case <-timer.C:
 		n.logger.Info("waiting for HS response timed-out. remoteKey=%v", remotePublicKey)
@@ -183,6 +192,13 @@ func (n *Net) createSecuredConnection(address string, remotePublicKey crypto.Pub
 	}
 
 	conn.SetSession(session)
+	port, err := strconv.ParseInt(strings.Split(address, ":")[1], 10, 32)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("can't parse address port err=%v", err)
+	}
+
+	conn.SetRemoteListenPort(int32(port))
 	return conn, nil
 }
 
@@ -270,12 +286,11 @@ func (n *Net) HandlePreSessionIncomingMessage(c Connection, message []byte) erro
 	// new remote connection doesn't hold the remote public key until it gets the handshake request
 	if c.RemotePublicKey() == nil {
 		rPub, err := crypto.NewPublicKey(data.GetNodePubKey())
-		n.Logger().Info("DEBUG: handling HS req from %v", rPub)
+		n.Logger().Debug("DEBUG: handling HS req from %v", rPub)
 		if err != nil {
 			return fmt.Errorf("%s. err: %v", errMsg, err)
 		}
 		c.SetRemotePublicKey(rPub)
-
 	}
 	respData, session, err := ProcessHandshakeRequest(n.NetworkID(), n.localNode.PublicKey(), n.localNode.PrivateKey(), c.RemotePublicKey(), data)
 	if err != nil {
@@ -292,6 +307,7 @@ func (n *Net) HandlePreSessionIncomingMessage(c Connection, message []byte) erro
 	}
 
 	c.SetSession(session)
+	c.SetRemoteListenPort(data.Port)
 	// update on new connection
 	n.publishNewRemoteConnection(c)
 	return nil

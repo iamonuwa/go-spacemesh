@@ -57,3 +57,5 @@ func (sm *SessionMock) SetDecrypt(res []byte, err error) {
 	sm.decResult = res
 	sm.decError = err
 }
+
+var _ NetworkSession = (*SessionMock)(nil)

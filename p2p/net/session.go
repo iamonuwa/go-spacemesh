@@ -4,8 +4,6 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/hex"
-	"errors"
-	"github.com/spacemeshos/go-spacemesh/crypto"
 	"github.com/spacemeshos/go-spacemesh/log"
 	"sync"
 	"time"
@@ -42,6 +40,7 @@ type NetworkSessionImpl struct {
 	localNodeID  string
 	remoteNodeID string
 
+	crypterLock    sync.Mutex
 	blockEncrypter cbcMode
 	blockDecrypter cbcMode
 }
@@ -101,31 +100,35 @@ func (n *NetworkSessionImpl) Created() time.Time {
 
 // Encrypt encrypts in binary data with the session's sym enc key.
 func (n *NetworkSessionImpl) Encrypt(in []byte) ([]byte, error) {
-	l := len(in)
-	if l == 0 {
-		return nil, errors.New("Invalid input buffer - 0 len")
-	}
-	paddedIn := crypto.AddPKCSPadding(in)
-	out := make([]byte, len(paddedIn))
-	n.blockEncrypter.CryptBlocks(out, paddedIn)
-	n.resetIV()
-	return out, nil
+	//l := len(in)
+	//if l == 0 {
+	//	return nil, errors.New("Invalid input buffer - 0 len")
+	//}
+	//paddedIn := crypto.AddPKCSPadding(in)
+	//out := make([]byte, len(paddedIn))
+	//n.crypterLock.Lock()
+	//n.blockEncrypter.CryptBlocks(out, paddedIn)
+	//n.crypterLock.Unlock()
+	//n.resetIV()
+	return in, nil
 }
 
 // Decrypt decrypts in binary data that was encrypted with the session's sym enc key.
 func (n *NetworkSessionImpl) Decrypt(in []byte) ([]byte, error) {
-	l := len(in)
-	if l == 0 {
-		return nil, errors.New("Invalid input buffer - 0 len")
-	}
-
-	n.blockDecrypter.CryptBlocks(in, in)
-	clearText, err := crypto.RemovePKCSPadding(in)
-	if err != nil {
-		return nil, err
-	}
-	n.resetIV()
-	return clearText, nil
+	//l := len(in)
+	//if l == 0 {
+	//	return nil, errors.New("Invalid input buffer - 0 len")
+	//}
+	//
+	//n.crypterLock.Lock()
+	//n.blockDecrypter.CryptBlocks(in, in)
+	//n.crypterLock.Unlock()
+	//clearText, err := crypto.RemovePKCSPadding(in)
+	//if err != nil {
+	//	return nil, err
+	//}
+	//n.resetIV()
+	return in, nil
 }
 
 // NewNetworkSession creates a new network session based on provided data

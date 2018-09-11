@@ -1,15 +1,14 @@
 package p2p
 
 import (
-	"encoding/hex"
 	"testing"
 	"time"
 
 	"errors"
 	"github.com/gogo/protobuf/proto"
-	"github.com/spacemeshos/go-spacemesh/crypto"
 	"github.com/spacemeshos/go-spacemesh/p2p/config"
 	"github.com/spacemeshos/go-spacemesh/p2p/dht"
+	"github.com/spacemeshos/go-spacemesh/p2p/message"
 	"github.com/spacemeshos/go-spacemesh/p2p/net"
 	"github.com/spacemeshos/go-spacemesh/p2p/node"
 	"github.com/spacemeshos/go-spacemesh/p2p/pb"
@@ -21,10 +20,9 @@ func p2pTestInstance(t testing.TB, config config.Config) *swarm {
 	port, err := node.GetUnboundedPort()
 	assert.NoError(t, err, "Error getting a port", err)
 	config.TCPPort = port
-	p, err := newSwarm(config, false)
+	p, err := newSwarm(config, true, true)
 	assert.NoError(t, err, "Error creating p2p stack, err: %v", err)
-	err = p.Start()
-	assert.NoError(t, err, err)
+	assert.NotNil(t, p)
 	return p
 }
 
@@ -41,7 +39,7 @@ func TestNew(t *testing.T) {
 }
 
 func Test_newSwarm(t *testing.T) {
-	s, err := newSwarm(config.DefaultConfig(), false)
+	s, err := newSwarm(config.DefaultConfig(), true, false)
 	assert.NoError(t, err)
 	err = s.Start()
 	assert.NoError(t, err, err)
@@ -49,28 +47,8 @@ func Test_newSwarm(t *testing.T) {
 	s.Shutdown()
 }
 
-func TestSwarm_signMessage(t *testing.T) {
-	n, _ := node.GenerateTestNode(t)
-	pm := &pb.ProtocolMessage{
-		Metadata: newProtocolMessageMetadata(n.PublicKey(), exampleProtocol, false),
-		Payload:  []byte(examplePayload),
-	}
-
-	bin, err := proto.Marshal(pm)
-	assert.NoError(t, err)
-
-	asig, err := n.PrivateKey().Sign(bin)
-
-	assert.NoError(t, err)
-
-	err = signMessage(n.PrivateKey(), pm)
-	assert.NoError(t, err, err)
-	assert.Equal(t, pm.Metadata.AuthorSign, hex.EncodeToString(asig))
-
-}
-
 func TestSwarm_Shutdown(t *testing.T) {
-	s, err := newSwarm(config.DefaultConfig(), false)
+	s, err := newSwarm(config.DefaultConfig(), true, false)
 	assert.NoError(t, err)
 	err = s.Start()
 	assert.NoError(t, err, err)
@@ -85,14 +63,13 @@ func TestSwarm_Shutdown(t *testing.T) {
 }
 
 func TestSwarm_ShutdownNoStart(t *testing.T) {
-	s, err := newSwarm(config.DefaultConfig(), false)
+	s, err := newSwarm(config.DefaultConfig(), true, false)
 	assert.NoError(t, err)
 	s.Shutdown()
 }
 
-
 func TestSwarm_RegisterProtocolNoStart(t *testing.T) {
-	s, err := newSwarm(config.DefaultConfig(), false)
+	s, err := newSwarm(config.DefaultConfig(), true, false)
 	msgs := s.RegisterProtocol("Anton")
 	assert.NotNil(t, msgs)
 	assert.NoError(t, err)
@@ -130,63 +107,6 @@ func TestSwarm_updateConnection(t *testing.T) {
 	assert.Equal(t, dhtmock.UpdateCount(), 1)
 }
 
-func TestSwarm_authAuthor(t *testing.T) {
-	// create a message
-
-	priv, pub, err := crypto.GenerateKeyPair()
-
-	assert.NoError(t, err, err)
-	assert.NotNil(t, priv)
-	assert.NotNil(t, pub)
-
-	pm := &pb.ProtocolMessage{
-		Metadata: newProtocolMessageMetadata(pub, exampleProtocol, false),
-		Payload:  []byte(examplePayload),
-	}
-	ppm, err := proto.Marshal(pm)
-	assert.NoError(t, err, "cant marshal msg ", err)
-
-	// sign it
-	s, err := priv.Sign(ppm)
-	assert.NoError(t, err, "cant sign ", err)
-	ssign := hex.EncodeToString(s)
-
-	pm.Metadata.AuthorSign = ssign
-
-	vererr := authAuthor(pm)
-	assert.NoError(t, vererr)
-
-	priv2, pub2, err := crypto.GenerateKeyPair()
-
-	assert.NoError(t, err, err)
-	assert.NotNil(t, priv2)
-	assert.NotNil(t, pub2)
-
-	s, err = priv2.Sign(ppm)
-	assert.NoError(t, err, "cant sign ", err)
-	ssign = hex.EncodeToString(s)
-
-	pm.Metadata.AuthorSign = ssign
-
-	vererr = authAuthor(pm)
-	assert.Error(t, vererr)
-}
-
-func TestSwarm_SignAuth(t *testing.T) {
-	n, _ := node.GenerateTestNode(t)
-	pm := &pb.ProtocolMessage{
-		Metadata: newProtocolMessageMetadata(n.PublicKey(), exampleProtocol, false),
-		Payload:  []byte(examplePayload),
-	}
-
-	err := signMessage(n.PrivateKey(), pm)
-	assert.NoError(t, err)
-
-	err = authAuthor(pm)
-
-	assert.NoError(t, err)
-}
-
 func TestSwarm_RoundTrip(t *testing.T) {
 	t.Skip()
 	p1 := p2pTestInstance(t, config.DefaultConfig())
@@ -216,36 +136,46 @@ func TestSwarm_RoundTrip(t *testing.T) {
 
 }
 
-func Test_newProtocolMessageMeatadata(t *testing.T) {
-	//newProtocolMessageMetadata()
-	_, pk, _ := crypto.GenerateKeyPair()
-	const gossip = false
-
-	assert.NotNil(t, pk)
-
-	meta := newProtocolMessageMetadata(pk, exampleProtocol, gossip)
-
-	assert.NotNil(t, meta, "should be a metadata")
-	assert.Equal(t, meta.Timestamp, time.Now().Unix())
-	assert.Equal(t, meta.ClientVersion, config.ClientVersion)
-	assert.Equal(t, meta.AuthPubKey, pk.Bytes())
-	assert.Equal(t, meta.Protocol, exampleProtocol)
-	assert.Equal(t, meta.Gossip, gossip)
-	assert.Equal(t, meta.AuthorSign, "")
-
+func TestSwarm_RegisterProtocol(t *testing.T) {
+	const numPeers = 100
+	nodechan := make(chan *swarm)
+	cfg := config.DefaultConfig()
+	for i := 0; i < numPeers; i++ {
+		go func() { // protocols are registered before starting the node and read after that.
+			// there ins't an actual need to sync them.
+			nod := p2pTestInstance(t, cfg)
+			nod.RegisterProtocol(exampleProtocol) // this is example
+			nodechan <- nod
+		}()
+	}
+	i := 0
+	for r := range nodechan {
+		_, ok := r.protocolHandlers[exampleProtocol]
+		assert.True(t, ok)
+		_, ok = r.protocolHandlers["/dht/1.0/find-node/"]
+		assert.True(t, ok)
+		i++
+		if i == numPeers {
+			close(nodechan)
+		}
+	}
 }
 
 func TestSwarm_onRemoteClientMessage(t *testing.T) {
+	cfg := config.DefaultConfig()
+	id, err := node.NewNodeIdentity(cfg, "0.0.0.0:0000", false)
+	assert.NoError(t, err, "we cant make node ?")
+
 	p := p2pTestInstance(t, config.DefaultConfig())
 	nmock := &net.ConnectionMock{}
-	nmock.SetRemotePublicKey(node.GenerateRandomNodeData().PublicKey())
+	nmock.SetRemotePublicKey(id.PublicKey())
 
 	// Test bad format
 
 	msg := []byte("badbadformat")
 	imc := net.IncomingMessageEvent{nmock, msg}
-	err := p.onRemoteClientMessage(imc)
-	assert.Equal(t, err, ErrBadFormat)
+	err = p.onRemoteClientMessage(imc)
+	assert.Equal(t, err, ErrBadFormat1)
 
 	// Test out of sync
 
@@ -299,12 +229,12 @@ func TestSwarm_onRemoteClientMessage(t *testing.T) {
 	session.SetDecrypt([]byte("wont_format_fo_protocol_message"), nil)
 
 	err = p.onRemoteClientMessage(imc)
-	assert.Equal(t, err, ErrBadFormat)
+	assert.Equal(t, err, ErrBadFormat2)
 
 	// Test bad auth sign
 
 	goodmsg := &pb.ProtocolMessage{
-		Metadata: newProtocolMessageMetadata(p.lNode.PublicKey(), exampleProtocol, false), // not signed
+		Metadata: message.NewProtocolMessageMetadata(id.PublicKey(), exampleProtocol, false), // not signed
 		Payload:  []byte(examplePayload),
 	}
 
@@ -320,7 +250,7 @@ func TestSwarm_onRemoteClientMessage(t *testing.T) {
 
 	// Test no protocol
 
-	err = signMessage(p.lNode.PrivateKey(), goodmsg)
+	err = message.SignMessage(id.PrivateKey(), goodmsg)
 	assert.NoError(t, err, err)
 
 	goodbin, _ = proto.Marshal(goodmsg)
@@ -340,4 +270,6 @@ func TestSwarm_onRemoteClientMessage(t *testing.T) {
 	err = p.onRemoteClientMessage(imc)
 
 	assert.NoError(t, err)
+
+	// todo : test gossip codepaths.
 }

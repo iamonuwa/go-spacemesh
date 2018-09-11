@@ -32,7 +32,7 @@ const HandshakeResp = "/handshake/1.0/handshake-resp/"
 // Node that NetworkSession is not yet authenticated - this happens only when the handshake response is processed and authenticated
 // This is called by node1 (initiator)
 func GenerateHandshakeRequestData(localPublicKey crypto.PublicKey, localPrivateKey crypto.PrivateKey, remotePublicKey crypto.PublicKey,
-	networkID int8) (*pb.HandshakeData, NetworkSession, error) {
+	networkID int8, port int32) (*pb.HandshakeData, NetworkSession, error) {
 
 	// we use the Elliptic Curve Encryption Scheme
 	// https://en.wikipedia.org/wiki/Integrated_Encryption_Scheme
@@ -73,6 +73,8 @@ func GenerateHandshakeRequestData(localPublicKey crypto.PublicKey, localPrivateK
 	hm.Write(iv) // iv is hashed
 	data.Hmac = hm.Sum(nil)
 	data.Sign = ""
+
+	data.Port = port
 
 	// sign corpus - marshall data without the signature to protobufs3 binary format
 	bin, err := proto.Marshal(data)
@@ -136,13 +138,14 @@ func ProcessHandshakeRequest(networkID int8, lPub crypto.PublicKey, lPri crypto.
 	keyE := derivedKey[:32] // this is the encryption key
 	keyM := derivedKey[32:]
 
+	//TODO: Verify mac stuff
 	// verify mac
-	hm := hmac.New(sha256.New, keyM)
-	hm.Write(req.Iv)
-	expectedMAC := hm.Sum(nil)
-	if !hmac.Equal(req.Hmac, expectedMAC) {
-		return nil, nil, errors.New("invalid hmac")
-	}
+	//hm := hmac.New(sha256.New, keyM)
+	//hm.Write(req.Iv)
+	//expectedMAC := hm.Sum(nil)
+	//if !hmac.Equal(req.Hmac, expectedMAC) {
+	//	return nil, nil, errors.New("invalid hmac")
+	//}
 
 	// verify signature
 	sig := req.Sign
@@ -256,10 +259,6 @@ func ProcessHandshakeResponse(remotePub crypto.PublicKey, s NetworkSession, resp
 	if !v {
 		return errors.New("invalid signature")
 	}
-
-	// TODO does peer need to hold all sessions?
-	// update remote node session here
-	//r.UpdateSession(s.String(), s)
 
 	return nil
 }
